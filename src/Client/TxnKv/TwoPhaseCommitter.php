@@ -27,6 +27,7 @@ use CrazyGoat\TiKV\Client\Batch\CheckedGrpcFuture;
 use CrazyGoat\TiKV\Client\Batch\GrpcFuture;
 use CrazyGoat\TiKV\Client\Cache\RegionCacheInterface;
 use CrazyGoat\TiKV\Client\Connection\PdClientInterface;
+use CrazyGoat\TiKV\Client\Exception\BatchDeadlineExceededException;
 use CrazyGoat\TiKV\Client\Exception\BatchPartialFailureException;
 use CrazyGoat\TiKV\Client\Exception\GrpcException;
 use CrazyGoat\TiKV\Client\Exception\InvalidStateException;
@@ -1288,16 +1289,22 @@ final readonly class TwoPhaseCommitter
         }
 
         $batchExecutor = new BatchAsyncExecutor($this->logger);
-        // Note on exception semantics (issue #291 review): with
-        // batchDeadlineMs > 0 a BatchDeadlineExceededException can escape
-        // commit() AFTER the status was already set to Committed above —
-        // the secondary commits were dispatched but not all awaited within
-        // the deadline. This is deliberate: the primary is durably
-        // committed (the commit point), so the data is durable either way;
-        // leftover secondary locks are resolved by readers. Do NOT catch it
-        // here and do NOT change the status — the deadline defaults to
-        // 0 (disabled).
-        $batchExecutor->executeParallel($regionCalls, $this->timeoutConfig->batchDeadlineMs);
+        // Exception semantics (issues #291 and #275): the batch deadline is
+        // finite by default, so BatchDeadlineExceededException can occur
+        // here AFTER the status was set to Committed — the secondary
+        // commits were dispatched but not all awaited within the deadline.
+        // The primary is durably committed (the commit point), so the
+        // transaction IS committed. Throwing would invite a retrying caller
+        // to apply it twice. Log it like any other secondary-commit failure
+        // and return; leftover secondary locks are resolved by readers.
+        try {
+            $batchExecutor->executeParallel($regionCalls, $this->timeoutConfig->batchDeadlineMs);
+        } catch (BatchDeadlineExceededException $e) {
+            $this->logger->warning(
+                'Secondary commit fan-out hit the batch deadline; locks will be resolved by readers',
+                ['exception' => $e],
+            );
+        }
     }
 
     /**

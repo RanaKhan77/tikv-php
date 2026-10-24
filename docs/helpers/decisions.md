@@ -1288,3 +1288,37 @@ Other decisions of #277:
    needs a way to hold a channel in flight for the lifetime of a stream, on
    the interface, and the transport is experimental and off by default.
 
+
+## The batch deadline is finite by default (#275)
+
+`TimeoutConfig::$batchDeadlineMs` defaults to 60000 instead of 0. A batch could run without any
+wall-clock bound, so a slow cluster stalled a PHP worker for a long time. The call sites already
+passed the deadline (RawKV V1, ApiV2, TxnKV through `BatchAsyncExecutor`), so the default was
+the missing part.
+
+1. The default equals the largest default per-call timeout (`ingestTimeoutMs`, 60000). The
+   default configuration passes its own validation.
+2. A deadline above 0 must be at least every per-call timeout used inside a fan-out (all seven:
+   write, batch read, batch write, scan, delete-range, checksum, ingest; `readTimeoutMs` is
+   used only by synchronous point reads, never inside a fan-out). A smaller
+   deadline has no effect on one call, and the constructor throws `InvalidArgumentException`.
+3. `0` stays the explicit opt-out. This is the same contract as in #276: the batch deadline is
+   a wall-clock budget, not a gRPC deadline.
+4. The default of the `$deadlineMs` parameters of `executeParallel()` and
+   `executeParallelCapped()` is `TimeoutConfig::DEFAULT_BATCH_DEADLINE_MS`, so a direct caller is
+   no longer unbounded without saying so.
+5. The deadline is checked at dispatch and wait boundaries only. We do not interrupt a blocking
+   wait. One wait on a retryable call runs the whole retry loop of one region, so the worst
+   case is `batchDeadlineMs` plus one region's full retry loop (the retry deadline, 30000 ms,
+   plus one per-call timeout).
+6. `executeParallelCapped()` and the parallel scan (`RawKvScanner::scanSegmentsInParallel()`)
+   use one shared budget for all windows. A deadline is never a reason for the scan to fall
+   back to the sequential path, which has no deadline. For scans the deadline applies per region
+   batch (up to `RegionScanBatch::MAX_REGIONS` regions), not per `scan()` call. The exception reports the configured
+   deadline, the total elapsed time and every region without a result.
+7. TxnKV: a deadline in the secondary-commit fan-out happens after the commit point, so it is
+   logged and `commit()` does not throw (a retrying caller could apply the transaction
+   twice). A deadline in a rollback fan-out throws, like a
+   partial failure: an early return would report a failed cleanup as a success, `rollback()`
+   would mark the state `RolledBack` and close it, and nobody would retry.
+8. Not covered: the experimental BatchCommands multiplex path is bounded per call only.
