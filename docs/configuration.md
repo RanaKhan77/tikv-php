@@ -1564,16 +1564,7 @@ try {
 }
 ```
 
-Or use async patterns:
-
-```php
-// For batch operations, process in chunks
-$chunks = array_chunk($keys, 100);
-foreach ($chunks as $chunk) {
-    $results = $client->batchGet($chunk);
-    // Process results
-}
-```
+Batch methods already send their sub-batches in parallel (default concurrency 16, `RawKvClient::DEFAULT_MAX_CONCURRENCY`). When you set the `batchDeadlineMs` timeout option to a value above 0, it bounds the whole fan-out. The default `0` disables it (see [Timeouts](#timeouts)).
 
 ## Production Configuration
 
