@@ -1191,6 +1191,37 @@ The CI `lint` job runs `composer audit --locked`, so a new advisory
 fails the build. Downstream users of the library are not affected:
 Composer ignores the lock file of a dependency.
 
+## Resolved transaction statuses are cached, FIFO, 2048, final outcomes only (#428)
+
+`TxnKvClient` owns one `ResolvedTxnStatusCache` and passes it to the `LockResolver` of every transaction (a final outcome per start ts is global, as in client-go's store-level `resolved`). It maps start ts to
+commit ts (0 means rolled back), FIFO eviction, 2048 entries as in client-go.
+The size is a constant (`DEFAULT_CAPACITY`) and is not an option, because no
+user-facing option group fits it.
+
+Only a final outcome enters the cache: a commit ts above 0, or an explicit
+`TTLExpireRollback` or `LockNotExistRollback` action. `NoAction` and
+`MinCommitTSPushed` (the lock is alive), `TTLExpirePessimisticRollback` and
+`LockNotExistDoNothing` can still change, so they are never cached. A status
+of `commit_ts = 0` without a rollback action is not a rollback proof.
+
+A cache hit skips the async-commit secondary check, because a final rollback
+of the primary is final for every secondary too.
+
+`resolveLocks()` sends `ResolveLockRequest.keys`, so it resolves only the
+locks it saw. The single-lock `resolveLock()` still sends no keys, so TiKV
+resolves every lock of that transaction in the region. Locks of a live
+transaction do not block the others: they are resolved first, and one
+`TxnRetryableException` follows. Pinned by `LockResolverBatchTest` and
+`ResolvedTxnStatusCacheTest`.
+
+Known follow-up: `NoAction` with `lock_ttl = 0` and `commit_ts = 0` is resolved as
+rolled back but is not cached, unlike client-go.
+
+Cache lifetime tests: `TxnKvClientTest::testTransactionsShareOneResolvedStatusCache`
+(second transaction meets the same lock, one `KvCheckTxnStatus`);
+`LockResolverBatchTest::testCachedRollbackSkipsSecondaryCheckForAsyncCommitLock` pins the
+cache-hit path for async-commit locks.
+
 ## Atomic mode and plain writes use different TiKV paths (#399)
 
 `setAtomicForCAS(true)` makes `put()`, `delete()`, `batchPut()` and
